@@ -19,6 +19,8 @@ from mcp.server.fastmcp.prompts import Prompt
 from mcp.server.fastmcp.resources import FunctionResource
 from mcp.cli.claude import get_claude_config_path
 from pydantic.networks import AnyUrl
+
+from dremioai.metrics.registry import get_metrics_app
 from dremioai.tools import tools
 import os
 from typing import List, Union, Annotated, Optional, Tuple, Dict, Any
@@ -80,6 +82,8 @@ class FastMCPServerWithAuthToken(FastMCP):
             # like ../mcp/{project_id}/..  and extract that project id as
             # context var
             app.add_middleware(ProjectIdMiddleware)
+
+        app.mount("/metrics", get_metrics_app(), name="metrics")
         return app
 
     def __init__(self, *args, **kwargs):
@@ -127,6 +131,7 @@ def init(
     mcp.add_prompt(
         Prompt.from_function(tools.system_prompt, "System Prompt", "System Prompt")
     )
+
     return mcp
 
 
