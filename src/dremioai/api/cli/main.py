@@ -13,6 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import logging
 
 from typer import Typer, Option, BadParameter, Argument
 from rich import print_json as pj, print as pp
@@ -32,9 +33,24 @@ from dremioai.api.cli.oauth import app as oauth_app
 def common_args(
     config_file: Annotated[
         Optional[Path],
-        Option("-c", "--config", help="The config file with Dremio connection details"),
+        Option(
+            "-c",
+            "--config",
+            help="The config file with Dremio connection details",
+        ),
     ] = None,
+    verbose: Annotated[
+        bool, Option("-v", "--verbose", help="Enable verbose logging")
+    ] = False,
+    debug: Annotated[bool, Option("--debug", help="Enable debug logging")] = False,
 ):
+    configure(to_file=False, enable_json_logging=False)
+    if debug:
+        set_level(logging.DEBUG)
+    elif verbose:
+        set_level(logging.INFO)
+    else:
+        set_level(logging.WARNING)
     settings.configure(config_file, force=True)
 
 
@@ -71,11 +87,6 @@ def run_catalog(
 # _qg = "Query / Job ID "
 @sql_app.command("run")
 def run_sql(
-    uri: Annotated[str, Option(envvar="DREMIO_URI", show_envvar=True, default=...)],
-    project_id: Annotated[
-        str, Option(envvar="DREMIO_PROJECT_ID", show_envvar=True, default=...)
-    ],
-    pat: Annotated[str, Option(envvar="DREMIO_PAT", show_envvar=True, default=...)],
     query: Annotated[
         Optional[str],
         Option(
@@ -88,6 +99,9 @@ def run_sql(
     use_df: Annotated[
         Optional[bool], Option(help="Convert results to pandas dataframe")
     ] = False,
+    use_adbc: Annotated[
+        Optional[bool], Option(help="Use ADBC to run the query")
+    ] = False,
 ):
     if query is None and job_id is None:
         raise BadParameter("Either query or job_id must be provided")
@@ -95,16 +109,24 @@ def run_sql(
     if query is not None:
         query = Path(query[1:]).read_text().strip() if query.startswith("@") else query
         query = f"/* dremioai: submitter=cli */\n{query}"
-        result = asyncio.run(sql.run_query(uri, pat, project_id, query, as_df=use_df))
+        result = asyncio.run(
+            sql.run_query(
+                query,
+                use_df=use_df,
+                use_adbc=use_adbc,
+            )
+        )
     else:
         result = asyncio.run(
-            sql.get_results(project_id, job_id, as_df=use_df, uri=uri, pat=pat)
+            sql.get_results(settings.instance().dremio.project_id, job_id)
         )
 
     pp(result if use_df else [r for jr in result for r in jr.rows])
 
 
-if __name__ == "__main__":
-    configure()
-    set_level("DEBUG")
+def main():
     app()
+
+
+if __name__ == "__main__":
+    main()

@@ -13,9 +13,11 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+from contextlib import asynccontextmanager
+from urllib.parse import urlparse, ParseResult
 
 from pydantic import BaseModel, Field
-from typing import List, Dict, Union, Optional, Any
+from typing import List, Dict, Union, Optional, Any, AsyncGenerator, Tuple
 
 from enum import auto
 from datetime import datetime
@@ -24,9 +26,12 @@ from dremioai.api.util import UStrEnum, run_in_parallel
 import pandas as pd
 import asyncio
 import itertools
+import warnings
 
 from dremioai.api.transport import DremioAsyncHttpClient as AsyncHttpClient
 from dremioai.config import settings
+from adbc_driver_flightsql import dbapi
+from adbc_driver_flightsql import DatabaseOptions, ConnectionOptions
 
 
 class ArcticSourceType(UStrEnum):
@@ -228,9 +233,105 @@ async def get_results(
     return jr
 
 
-async def run_query(
+def convert_to_adbc_uri(uri: str, is_dc: bool = False) -> ParseResult:
+    u = urlparse(uri)
+    if is_dc and u.netloc.startswith("api."):
+        u = u._replace(netloc=f"data.{u.netloc[4:]}")
+    return u._replace(scheme="grpc+tls")
+
+
+def create_adbc_connection_options(
+    pat: str, project_id: str = None
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    session_options = {"routing_tag": "MCP"}
+    db_args = {
+        DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {pat}",
+        f"{DatabaseOptions.RPC_CALL_HEADER_PREFIX.value}useEncryption": "true",
+    }
+    if project_id:
+        db_args[f"{DatabaseOptions.RPC_CALL_HEADER_PREFIX.value}Cookie"] = (
+            f"project_id={project_id}"
+        )
+    return db_args, {
+        f"{ConnectionOptions.OPTION_SESSION_OPTION_PREFIX.value}{key}": value
+        for key, value in session_options.items()
+    }
+
+
+@asynccontextmanager
+async def adbc_connect(
+    uri: str, db_args: Dict[str, Any], conn_args: Dict[str, Any]
+) -> AsyncGenerator[dbapi.Connection, None]:
+    conn = None
+    try:
+        # Suppress the autocommit warning from ADBC driver manager
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Cannot disable autocommit; conn will not be DB-API 2.0 compliant",
+                category=UserWarning,
+            )
+            conn = await asyncio.to_thread(
+                dbapi.connect, uri=uri, db_kwargs=db_args, conn_kwargs=conn_args
+            )
+        yield conn
+    finally:
+        if conn is not None:
+            await asyncio.to_thread(conn.close)
+
+
+@asynccontextmanager
+async def adbc_cursor(conn: dbapi.Connection) -> AsyncGenerator[dbapi.Cursor, None]:
+    cursor = None
+    try:
+        cursor = await asyncio.to_thread(conn.cursor)
+        yield cursor
+    finally:
+        if cursor is not None:
+            await asyncio.to_thread(cursor.close)
+
+
+def convert_to_job_results(schema: List[Tuple], rows: List[Tuple]) -> JobResultsWrapper:
+    rs = [
+        ResultSchema(name=info[0], type=ResultSchemaType(name=str(info[1])))
+        for info in schema
+    ]
+
+    def convert_row(row: Tuple) -> Dict[str, Any]:
+        return {rs[ix].name: col for ix, col in enumerate(row)}
+
+    rsrows = [convert_row(row) for row in rows]
+    return JobResultsWrapper([JobResults(rowCount=len(rows), schema=rs, rows=rsrows)])
+
+
+async def run_adbc_query(
     query: Union[Query, str], use_df: bool = False
 ) -> Union[JobResultsWrapper, pd.DataFrame]:
+    if not isinstance(query, Query):
+        query = Query(sql=query)
+
+    uri = convert_to_adbc_uri(
+        settings.instance().dremio.uri, is_dc=settings.instance().dremio.is_cloud
+    ).geturl()
+    db_args, conn_args = create_adbc_connection_options(
+        settings.instance().dremio.pat, settings.instance().dremio.project_id
+    )
+
+    async with adbc_connect(uri, db_args, conn_args) as conn:
+        async with adbc_cursor(conn) as cursor:
+            await asyncio.to_thread(cursor.execute, query.sql)
+            if use_df:
+                return await asyncio.to_thread(cursor.fetch_df)
+            rows = await asyncio.to_thread(cursor.fetchall)
+            return convert_to_job_results(cursor.description, rows)
+
+
+async def run_query(
+    query: Union[Query, str], use_df: bool = False, use_adbc: bool = False
+) -> Union[JobResultsWrapper, pd.DataFrame]:
+    if use_adbc:
+        return await run_adbc_query(query, use_df=use_df)
+
     client = AsyncHttpClient()
     if not isinstance(query, Query):
         query = Query(sql=query)
