@@ -144,6 +144,8 @@ class Dremio(BaseModel):
     )
     oauth2: Optional[OAuth2] = None
     allow_dml: Optional[bool] = False
+    use_arrow: Optional[bool] = False
+    no_tls_for_arrow: Optional[bool] = False
     model_config = ConfigDict(validate_assignment=True)
 
     @field_serializer("raw_pat")

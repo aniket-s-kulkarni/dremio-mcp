@@ -346,14 +346,14 @@ async def run_adbc_query(
 async def run_query(
     query: Union[Query, str],
     use_df: bool = False,
-    use_adbc: bool = False,
-    no_tls: bool = False,
 ) -> Union[JobResultsWrapper, pd.DataFrame]:
-    if use_adbc:
+    if settings.instance().dremio.use_arrow:
         log.logger("adbc").debug(
-            f"Using ADBC to run query: {query}, use_df={use_df}, no_tls={no_tls}"
+            f"Using ADBC to run query: {query}, use_df={use_df}, no_tls={settings.instance().dremio.no_tls_for_arrow}"
         )
-        return await run_adbc_query(query, use_df=use_df, no_tls=no_tls)
+        return await run_adbc_query(
+            query, use_df=use_df, no_tls=settings.instance().dremio.no_tls_for_arrow
+        )
 
     client = AsyncHttpClient()
     if not isinstance(query, Query):

@@ -99,11 +99,10 @@ def _run_sql(
         query = Path(query[1:]).read_text().strip() if query.startswith("@") else query
         query = f"/* dremioai: submitter=cli */\n{query}"
         result = asyncio.run(
-            sql.run_query(
-                query,
-                use_df=use_df,
-                use_adbc=use_adbc,
-                no_tls=no_tls,
+            settings.run_with(
+                sql.run_query,
+                {"dremio.use_arrow": use_adbc, "dremio.no_tls_for_arrow": no_tls},
+                [query, use_df],
             )
         )
     else:
