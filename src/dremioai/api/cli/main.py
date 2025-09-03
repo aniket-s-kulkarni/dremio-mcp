@@ -21,7 +21,7 @@ from typing import Annotated, Optional, List
 from pathlib import Path
 from dremioai.api.dremio import catalog, sql
 import asyncio
-from dremioai.log import configure, set_level
+from dremioai.log import configure, set_level, logger
 from dremioai.config import settings
 
 from dremioai.api.cli.engines import app as engines_app
@@ -52,6 +52,7 @@ def common_args(
     else:
         set_level(logging.WARNING)
     settings.configure(config_file, force=True)
+    logger("cli").debug(f"Settings: {settings.instance().model_dump()}")
 
 
 app = Typer(context_settings=dict(help_option_names=["-h", "--help"]))
@@ -84,6 +85,35 @@ def run_catalog(
     pp(schema)
 
 
+def _run_sql(
+    query: str,
+    job_id: str = None,
+    use_df: bool = False,
+    use_adbc: bool = False,
+    no_tls: bool = False,
+):
+    if query is None and job_id is None:
+        raise BadParameter("Either query or job_id must be provided")
+
+    if query is not None:
+        query = Path(query[1:]).read_text().strip() if query.startswith("@") else query
+        query = f"/* dremioai: submitter=cli */\n{query}"
+        result = asyncio.run(
+            sql.run_query(
+                query,
+                use_df=use_df,
+                use_adbc=use_adbc,
+                no_tls=no_tls,
+            )
+        )
+    else:
+        result = asyncio.run(
+            sql.get_results(settings.instance().dremio.project_id, job_id)
+        )
+
+    pp(result if use_df else [r for jr in result for r in jr.rows])
+
+
 # _qg = "Query / Job ID "
 @sql_app.command("run")
 def run_sql(
@@ -102,26 +132,20 @@ def run_sql(
     use_adbc: Annotated[
         Optional[bool], Option(help="Use ADBC to run the query")
     ] = False,
+    no_tls: Annotated[
+        Optional[bool], Option(help="Disable TLS for ADBC connection")
+    ] = False,
+    project_id: Annotated[
+        Optional[str], Option(help="Project ID override (for Dremio Cloud)")
+    ] = None,
 ):
-    if query is None and job_id is None:
-        raise BadParameter("Either query or job_id must be provided")
-
-    if query is not None:
-        query = Path(query[1:]).read_text().strip() if query.startswith("@") else query
-        query = f"/* dremioai: submitter=cli */\n{query}"
-        result = asyncio.run(
-            sql.run_query(
-                query,
-                use_df=use_df,
-                use_adbc=use_adbc,
-            )
+    args = [query, job_id, use_df, use_adbc, no_tls]
+    if project_id is not None:
+        settings.run_with(
+            _run_sql, overrides={"dremio.project_id": project_id}, args=args
         )
     else:
-        result = asyncio.run(
-            sql.get_results(settings.instance().dremio.project_id, job_id)
-        )
-
-    pp(result if use_df else [r for jr in result for r in jr.rows])
+        _run_sql(*args)
 
 
 def main():

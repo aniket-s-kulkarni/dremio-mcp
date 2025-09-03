@@ -21,6 +21,8 @@ from typing import List, Dict, Union, Optional, Any, AsyncGenerator, Tuple
 
 from enum import auto
 from datetime import datetime
+
+from dremioai import log
 from dremioai.api.util import UStrEnum, run_in_parallel
 
 import pandas as pd
@@ -31,7 +33,7 @@ import warnings
 from dremioai.api.transport import DremioAsyncHttpClient as AsyncHttpClient
 from dremioai.config import settings
 from adbc_driver_flightsql import dbapi
-from adbc_driver_flightsql import DatabaseOptions, ConnectionOptions
+from adbc_driver_flightsql import DatabaseOptions
 
 
 class ArcticSourceType(UStrEnum):
@@ -233,36 +235,48 @@ async def get_results(
     return jr
 
 
-def convert_to_adbc_uri(uri: str, is_dc: bool = False) -> ParseResult:
+def convert_to_adbc_uri(
+    uri: str, is_dc: bool = False, no_tls: bool = False
+) -> ParseResult:
     u = urlparse(uri)
-    if is_dc and u.netloc.startswith("api."):
-        u = u._replace(netloc=f"data.{u.netloc[4:]}")
-    return u._replace(scheme="grpc+tls")
+    if is_dc:
+        # for DC, we use the data.* endpoint
+        if u.netloc.startswith("api."):
+            u = u._replace(netloc=f"data.{u.netloc[4:]}")
+    else:
+        # for SW, we use port 32010 for ADBC
+        u = u._replace(netloc=f"{u.hostname}:32010")
+    scheme = "grpc" if no_tls else "grpc+tls"
+    return u._replace(scheme=scheme)
 
 
 def create_adbc_connection_options(
-    pat: str, project_id: str = None
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    session_options = {"routing_tag": "MCP"}
+    pat: str, project_id: str = None, no_tls: bool = False
+) -> Dict[str, Any]:
     db_args = {
         DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {pat}",
-        f"{DatabaseOptions.RPC_CALL_HEADER_PREFIX.value}useEncryption": "true",
+        f"{DatabaseOptions.RPC_CALL_HEADER_PREFIX.value}useEncryption": (
+            "false" if no_tls else "true"
+        ),
+        f"{DatabaseOptions.RPC_CALL_HEADER_PREFIX.value}routing_tag": "MCP",
     }
+
+    if no_tls:
+        # only useful for SW deployments where TLS is not configured
+        db_args[DatabaseOptions.TLS_SKIP_VERIFY.value] = "true"
+
     if project_id:
         db_args[f"{DatabaseOptions.RPC_CALL_HEADER_PREFIX.value}Cookie"] = (
             f"project_id={project_id}"
         )
-    return db_args, {
-        f"{ConnectionOptions.OPTION_SESSION_OPTION_PREFIX.value}{key}": value
-        for key, value in session_options.items()
-    }
+    return db_args
 
 
 @asynccontextmanager
 async def adbc_connect(
-    uri: str, db_args: Dict[str, Any], conn_args: Dict[str, Any]
+    uri: str, db_args: Dict[str, Any]
 ) -> AsyncGenerator[dbapi.Connection, None]:
-    conn = None
+    conn: dbapi.Connection | None = None
     try:
         # Suppress the autocommit warning from ADBC driver manager
         with warnings.catch_warnings():
@@ -271,10 +285,10 @@ async def adbc_connect(
                 message="Cannot disable autocommit; conn will not be DB-API 2.0 compliant",
                 category=UserWarning,
             )
-            conn = await asyncio.to_thread(
-                dbapi.connect, uri=uri, db_kwargs=db_args, conn_kwargs=conn_args
-            )
-        yield conn
+            conn = await asyncio.to_thread(dbapi.connect, uri=uri, db_kwargs=db_args)
+            # conn is _Closeable, but don't use async with ... since conn.close()
+            # is synchronous and it should be handled asynchronously in the finally block
+            yield conn
     finally:
         if conn is not None:
             await asyncio.to_thread(conn.close)
@@ -305,19 +319,22 @@ def convert_to_job_results(schema: List[Tuple], rows: List[Tuple]) -> JobResults
 
 
 async def run_adbc_query(
-    query: Union[Query, str], use_df: bool = False
+    query: Union[Query, str], use_df: bool = False, no_tls: bool = False
 ) -> Union[JobResultsWrapper, pd.DataFrame]:
     if not isinstance(query, Query):
         query = Query(sql=query)
 
     uri = convert_to_adbc_uri(
-        settings.instance().dremio.uri, is_dc=settings.instance().dremio.is_cloud
+        settings.instance().dremio.uri,
+        is_dc=settings.instance().dremio.is_cloud,
+        no_tls=no_tls,
     ).geturl()
-    db_args, conn_args = create_adbc_connection_options(
-        settings.instance().dremio.pat, settings.instance().dremio.project_id
+    db_args = create_adbc_connection_options(
+        settings.instance().dremio.pat, settings.instance().dremio.project_id, no_tls
     )
+    log.logger("adbc").debug(f"Connecting to {uri} with {db_args}")
 
-    async with adbc_connect(uri, db_args, conn_args) as conn:
+    async with adbc_connect(uri, db_args) as conn:
         async with adbc_cursor(conn) as cursor:
             await asyncio.to_thread(cursor.execute, query.sql)
             if use_df:
@@ -327,10 +344,16 @@ async def run_adbc_query(
 
 
 async def run_query(
-    query: Union[Query, str], use_df: bool = False, use_adbc: bool = False
+    query: Union[Query, str],
+    use_df: bool = False,
+    use_adbc: bool = False,
+    no_tls: bool = False,
 ) -> Union[JobResultsWrapper, pd.DataFrame]:
     if use_adbc:
-        return await run_adbc_query(query, use_df=use_df)
+        log.logger("adbc").debug(
+            f"Using ADBC to run query: {query}, use_df={use_df}, no_tls={no_tls}"
+        )
+        return await run_adbc_query(query, use_df=use_df, no_tls=no_tls)
 
     client = AsyncHttpClient()
     if not isinstance(query, Query):
