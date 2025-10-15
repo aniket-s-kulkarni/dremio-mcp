@@ -13,6 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import os
 import uuid
 from uuid import UUID
 from urllib.parse import urlparse
@@ -330,6 +331,12 @@ class Settings(BaseSettings):
         use_enum_values=True,
     )
 
+    @staticmethod
+    def has_env_vars() -> bool:
+        if prefix := Settings.model_config.get("env_prefix"):
+            return any(k.startswith(prefix) for k in os.environ)
+        return False
+
     def with_overrides(self, overrides: Dict[str, Any]) -> Self:
         def set_values(aparts: List[str], value: Any, obj: Any):
             if len(aparts) == 1 and hasattr(obj, aparts[0]):
@@ -380,6 +387,10 @@ def configure(cfg: Union[str, Path] = None, force=False) -> ContextVar[Settings]
         cfg = Path(cfg)
 
     if cfg is None:
+        if Settings.has_env_vars():
+            _settings.set(Settings())
+            return _settings
+
         cfg = default_config()
 
     if not cfg.exists():
@@ -399,11 +410,14 @@ def configure(cfg: Union[str, Path] = None, force=False) -> ContextVar[Settings]
 def instance() -> Settings | None:
     global _settings
     if not isinstance(_settings.get(), Settings):
-        try:
-            configure()  # use default config, if exists
-        except FileNotFoundError:
-            # no default config, create a new default one
+        if Settings.has_env_vars():
             _settings.set(Settings())
+        else:
+            try:
+                configure()  # use default config, if exists
+            except FileNotFoundError:
+                # no default config, create a new default one
+                _settings.set(Settings())
     return _settings.get()
 
 
