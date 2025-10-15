@@ -13,18 +13,24 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import uuid
+
 from mcp.server.auth.json_response import PydanticJSONResponse
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.prompts import Prompt
 from mcp.server.fastmcp.resources import FunctionResource
 from mcp.cli.claude import get_claude_config_path
-from mcp.shared.auth import OAuthMetadata
-from pydantic import AnyHttpUrl
+from mcp.shared.auth import (
+    OAuthMetadata,
+    OAuthClientMetadata,
+    OAuthClientInformationFull,
+)
+from pydantic import AnyHttpUrl, ValidationError
 from pydantic.networks import AnyUrl
 
 from dremioai.metrics.registry import get_metrics_app
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
 
 from dremioai.tools import tools
 import os
@@ -169,14 +175,19 @@ def init(
         Prompt.from_function(tools.system_prompt, "System Prompt", "System Prompt")
     )
 
-    @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
-    async def authorization_server_metadata(request: Request) -> Response:
+    async def _get_oauth_metadata(request: Request) -> Response:
+        """Common handler for OAuth/OIDC metadata endpoints"""
         if issuer := settings.instance().dremio.auth_issuer_uri:
             auth, tok = settings.instance().dremio.auth_endpoints
+            # Construct the registration endpoint URL based on the request
+            base_url = f"{request.url.scheme}://{request.url.netloc}"
+            registration_url = f"{base_url}/oauth/register"
+
             md = OAuthMetadata(
                 issuer=AnyHttpUrl(issuer),
                 authorization_endpoint=auth,
                 token_endpoint=tok,
+                registration_endpoint=AnyHttpUrl(registration_url),
                 scopes_supported=["dremio.all", "offline_access"],
                 response_types_supported=["code"],
                 grant_types_supported=["authorization_code", "refresh_token"],
@@ -185,6 +196,78 @@ def init(
             )
             return PydanticJSONResponse(md)
         return Response(status_code=404)
+
+    @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+    async def authorization_server_metadata(request: Request) -> Response:
+        return await _get_oauth_metadata(request)
+
+    @mcp.custom_route("/.well-known/openid-configuration", methods=["GET"])
+    async def openid_configuration(request: Request) -> Response:
+        return await _get_oauth_metadata(request)
+
+    @mcp.custom_route("/.well-known/oauth-authorization-server/mcp", methods=["GET"])
+    async def authorization_server_metadata_mcp(request: Request) -> Response:
+        return await _get_oauth_metadata(request)
+
+    @mcp.custom_route("/.well-known/openid-configuration/mcp", methods=["GET"])
+    async def openid_configuration_mcp(request: Request) -> Response:
+        return await _get_oauth_metadata(request)
+
+    @mcp.custom_route("/oauth/register", methods=["POST"])
+    async def oauth_register(request: Request) -> Response:
+        """OAuth client registration endpoint following RFC 7591"""
+        import json
+        from time import time
+
+        # Parse request body
+        try:
+            body = await request.body()
+            body_json = json.loads(body) if body else {}
+        except json.JSONDecodeError as e:
+            log.logger("dcr").error(f"Invalid JSON in registration request: {str(e)}")
+            return JSONResponse(
+                content={
+                    "error": "invalid_request",
+                    "error_description": f"Invalid JSON: {str(e)}",
+                },
+                status_code=400,
+            )
+
+        # Log the registration request
+        log.logger("dcr").info(f"OAuth client registration request: {body_json}")
+
+        # Validate and parse the client metadata
+        try:
+            client_metadata = OAuthClientMetadata.model_validate(body_json)
+        except ValidationError as e:
+            log.logger("dcr").error(f"Client metadata validation failed: {str(e)}")
+            return JSONResponse(
+                content={
+                    "error": "invalid_client_metadata",
+                    "error_description": f"Validation failed: {str(e)}",
+                },
+                status_code=400,
+            )
+
+        # Create the full client information response
+        # This includes the metadata plus client_id and optional client_secret
+        client_metadata.scope = "dremio.all offline_access"
+        client_info = OAuthClientInformationFull(
+            **client_metadata.model_dump(),
+            client_id="172bdf86-28ca-4933-b46f-9519b413271c",
+            client_secret=str(
+                uuid.uuid4()
+            ),  # No secret for public clients or when using PKCE
+            client_id_issued_at=int(time()),
+            client_secret_expires_at=0,  # 0 means it doesn't expire (or N/A for public clients)
+        )
+
+        log.logger("dcr").info(
+            f"Successfully registered OAuth client: {client_info.model_dump_json()}"
+        )
+
+        # Return the response using PydanticJSONResponse for proper serialization
+        return PydanticJSONResponse(client_info, status_code=201)
 
     @mcp.custom_route("/healthz", methods=["GET"])
     async def health_check(_request: Request) -> Response:
@@ -201,7 +284,11 @@ def create_metrics_server(host: str, port: int, log_level: str) -> uvicorn.Serve
     # Create a separate uvicorn server for Prometheus metrics.
     metrics_app = get_metrics_app()
     config = uvicorn.Config(
-        app=metrics_app, host=host, port=port, log_level=log_level.lower(), access_log=False
+        app=metrics_app,
+        host=host,
+        port=port,
+        log_level=log_level.lower(),
+        access_log=False,
     )
     server = uvicorn.Server(config)
 
@@ -227,10 +314,8 @@ def run_with_metrics_server(
         log.logger("server_startup").info("Starting metrics server as background task")
 
         threading.Thread(
-            target=lambda: asyncio.run(metrics_server.serve()), 
-            daemon=True
+            target=lambda: asyncio.run(metrics_server.serve()), daemon=True
         ).start()
-
 
     app.run(transport=transport.value)
 
@@ -347,10 +432,16 @@ def show_default_config(
         case ConfigTypes.dremioai:
             dc = settings.default_config()
             pp(f"Default config file: {dc!s} (exists = {dc.exists()!s})")
+            if settings.Settings.has_env_vars():
+                pp(
+                    "[bold]Environment variables are present, so default config is not used[/bold]"
+                )
+                dc = None
             if not show_filename:
                 settings.configure(dc)
                 pp(
-                    dump(
+                    "--\n"
+                    + dump(
                         settings.instance().model_dump(
                             exclude_none=True,
                             mode="json",
