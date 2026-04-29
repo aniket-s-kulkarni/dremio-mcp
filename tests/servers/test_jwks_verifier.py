@@ -32,6 +32,7 @@ from mcp.server.streamable_http import (
 from mcp.shared.context import RequestContext
 from starlette.requests import Request
 
+from dremioai import log
 from dremioai.servers.jwks_verifier import JWKSVerifier, VerifiedClaims, TokenExpiredError
 from dremioai.servers.mcp import make_logged_invoke, RequireAuthWithWWWAuthenticateMiddleware
 
@@ -274,6 +275,15 @@ class TestDispatchWarning:
 class TestMakeLoggedInvoke:
     """Tests for make_logged_invoke WARNING logging on tool exceptions."""
 
+    @pytest.fixture
+    def info_logging(self):
+        previous_level = log.level()
+        log.set_level(logging.INFO)
+        try:
+            yield
+        finally:
+            log.set_level(previous_level)
+
     @pytest.mark.asyncio
     async def test_logs_warning_on_exception(self, caplog):
         async def failing_fn():
@@ -302,7 +312,7 @@ class TestMakeLoggedInvoke:
         assert len(warning_records) == 0
 
     @pytest.mark.asyncio
-    async def test_logs_info_on_success(self, caplog):
+    async def test_logs_info_on_success(self, caplog, info_logging):
         async def ok_fn():
             return "ok"
 
@@ -319,7 +329,7 @@ class TestMakeLoggedInvoke:
         )
 
     @pytest.mark.asyncio
-    async def test_logs_mcp_request_context(self, caplog):
+    async def test_logs_mcp_request_context(self, caplog, info_logging):
         async def ok_fn():
             return "ok"
 
