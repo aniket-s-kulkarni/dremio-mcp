@@ -24,6 +24,13 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import jwt as pyjwt
 from jwt import PyJWKClient, PyJWKClientError, ExpiredSignatureError
+from mcp.server.lowlevel.server import request_ctx
+from mcp.server.streamable_http import (
+    MCP_PROTOCOL_VERSION_HEADER,
+    MCP_SESSION_ID_HEADER,
+)
+from mcp.shared.context import RequestContext
+from starlette.requests import Request
 
 from dremioai.servers.jwks_verifier import JWKSVerifier, VerifiedClaims, TokenExpiredError
 from dremioai.servers.mcp import make_logged_invoke, RequireAuthWithWWWAuthenticateMiddleware
@@ -293,3 +300,65 @@ class TestMakeLoggedInvoke:
         assert result == "ok"
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) == 0
+
+    @pytest.mark.asyncio
+    async def test_logs_info_on_success(self, caplog):
+        async def ok_fn():
+            return "ok"
+
+        wrapped = make_logged_invoke("good_tool", ok_fn)
+        with caplog.at_level(logging.INFO):
+            result = await wrapped()
+        assert result == "ok"
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            "Tool invocation completed" in str(r.message)
+            and "good_tool" in str(r.message)
+            and "success" in str(r.message)
+            for r in info_records
+        )
+
+    @pytest.mark.asyncio
+    async def test_logs_mcp_request_context(self, caplog):
+        async def ok_fn():
+            return "ok"
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/mcp/project-123",
+                "headers": [
+                    (MCP_SESSION_ID_HEADER.encode(), b"session-abc"),
+                    (MCP_PROTOCOL_VERSION_HEADER.encode(), b"2025-06-18"),
+                ],
+                "client": ("192.0.2.10", 4321),
+                "server": ("testserver", 80),
+                "scheme": "http",
+            }
+        )
+        token = request_ctx.set(
+            RequestContext(
+                request_id="rpc-123",
+                meta=None,
+                session=None,
+                lifespan_context=None,
+                request=request,
+            )
+        )
+        try:
+            wrapped = make_logged_invoke("context_tool", ok_fn)
+            with caplog.at_level(logging.INFO):
+                result = await wrapped()
+        finally:
+            request_ctx.reset(token)
+
+        assert result == "ok"
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            "session-abc" in str(r.message)
+            and "rpc-123" in str(r.message)
+            and "192.0.2.10" in str(r.message)
+            and "context_tool" in str(r.message)
+            for r in info_records
+        )

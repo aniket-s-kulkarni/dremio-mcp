@@ -34,12 +34,20 @@ import uvicorn
 from click import Choice
 from mcp.cli.claude import get_claude_config_path
 from mcp.server.auth.json_response import PydanticJSONResponse
-from mcp.server.auth.middleware.auth_context import AuthContextMiddleware, get_access_token
+from mcp.server.auth.middleware.auth_context import (
+    AuthContextMiddleware,
+    get_access_token,
+)
 from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.prompts import Prompt
 from mcp.server.fastmcp.resources import FunctionResource
+from mcp.server.lowlevel.server import request_ctx
+from mcp.server.streamable_http import (
+    MCP_PROTOCOL_VERSION_HEADER,
+    MCP_SESSION_ID_HEADER,
+)
 from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
 from pydantic.networks import AnyUrl
@@ -229,18 +237,64 @@ def _make_mock_invoke(tool_class_name: str, original_doc: str):
     return mock_invoke
 
 
+def _mcp_request_log_context() -> Dict[str, Any]:
+    try:
+        ctx = request_ctx.get()
+    except LookupError:
+        return {}
+
+    request = getattr(ctx, "request", None)
+    log_context: Dict[str, Any] = {
+        "jsonrpc_request_id": str(ctx.request_id),
+    }
+    if request is not None:
+        log_context.update(
+            {
+                "mcp_session_id": request.headers.get(MCP_SESSION_ID_HEADER),
+                "mcp_protocol_version": request.headers.get(
+                    MCP_PROTOCOL_VERSION_HEADER
+                ),
+                "client": request.client.host if request.client else None,
+                "method": request.method,
+                "path": request.url.path,
+            }
+        )
+
+    if project_id := ProjectIdMiddleware.get_project_id():
+        log_context["project_id"] = project_id
+
+    if isinstance((token := get_access_token()), AccessToken):
+        log_context["user_id"] = token.client_id
+
+    return {key: value for key, value in log_context.items() if value is not None}
+
+
 def make_logged_invoke(tool_name: str, fn):
     _log = log.logger("tool_invoke")
 
     @wraps(fn)
     async def _wrapper(*args, **kwargs):
+        started = time.perf_counter()
+        log_context = _mcp_request_log_context()
         try:
-            return await fn(*args, **kwargs)
+            result = await fn(*args, **kwargs)
+            _log.info(
+                "Tool invocation completed",
+                tool=tool_name,
+                outcome="success",
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                **log_context,
+            )
+            return result
         except Exception as exc:
             _log.warning(
                 "Tool invocation raised an exception",
                 tool=tool_name,
+                outcome="error",
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                error_type=type(exc).__name__,
                 error=str(exc),
+                **log_context,
             )
             raise
 
@@ -295,13 +349,15 @@ def init(
         tool_instance = tool()
         is_sql_tool = tool is tools.RunSqlQuery
         if mock:
-            invoke_fn = _make_mock_invoke(
-                tool.__name__, tool_instance.invoke.__doc__
-            )
+            invoke_fn = _make_mock_invoke(tool.__name__, tool_instance.invoke.__doc__)
         else:
             invoke_fn = tool_instance.invoke
         mcp.add_tool(
-            invoke_fn if mock else make_logged_invoke(tool.__name__, tool_instance.invoke),
+            (
+                invoke_fn
+                if mock
+                else make_logged_invoke(tool.__name__, tool_instance.invoke)
+            ),
             name=tool.__name__,
             description=tool_instance.invoke.__doc__,
             annotations=ToolAnnotations(
