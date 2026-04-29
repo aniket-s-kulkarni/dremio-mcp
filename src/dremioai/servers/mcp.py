@@ -20,6 +20,7 @@ import os
 import sys
 import threading
 import time
+from uuid import uuid4
 from enum import StrEnum, auto
 from functools import reduce, wraps
 from json import dump as jdump
@@ -58,6 +59,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.responses import Response as StarletteResponse
+from structlog.contextvars import bound_contextvars
 from typer import Argument, BadParameter, Option, Typer
 from yaml import dump
 
@@ -275,28 +277,29 @@ def make_logged_invoke(tool_name: str, fn):
     @wraps(fn)
     async def _wrapper(*args, **kwargs):
         started = time.perf_counter()
-        log_context = _mcp_request_log_context()
-        try:
-            result = await fn(*args, **kwargs)
-            _log.info(
-                "Tool invocation completed",
-                tool=tool_name,
-                outcome="success",
-                duration_ms=round((time.perf_counter() - started) * 1000, 3),
-                **log_context,
-            )
-            return result
-        except Exception as exc:
-            _log.warning(
-                "Tool invocation raised an exception",
-                tool=tool_name,
-                outcome="error",
-                duration_ms=round((time.perf_counter() - started) * 1000, 3),
-                error_type=type(exc).__name__,
-                error=str(exc),
-                **log_context,
-            )
-            raise
+        log_context = {
+            **_mcp_request_log_context(),
+            "tool": tool_name,
+            "tool_invocation_id": str(uuid4()),
+        }
+        with bound_contextvars(**log_context):
+            try:
+                result = await fn(*args, **kwargs)
+                _log.info(
+                    "Tool invocation completed",
+                    outcome="success",
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                )
+                return result
+            except Exception as exc:
+                _log.warning(
+                    "Tool invocation raised an exception",
+                    outcome="error",
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                raise
 
     return _wrapper
 

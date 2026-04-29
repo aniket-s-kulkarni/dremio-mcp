@@ -372,3 +372,63 @@ class TestMakeLoggedInvoke:
             and "context_tool" in str(r.message)
             for r in info_records
         )
+
+    @pytest.mark.asyncio
+    async def test_propagates_mcp_request_context_to_nested_logs(
+        self, caplog, info_logging
+    ):
+        nested_logger = log.logger("nested_tool_log")
+
+        async def ok_fn():
+            nested_logger.info("Nested tool log")
+            return "ok"
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/mcp/project-123",
+                "headers": [
+                    (MCP_SESSION_ID_HEADER.encode(), b"session-abc"),
+                    (MCP_PROTOCOL_VERSION_HEADER.encode(), b"2025-06-18"),
+                ],
+                "client": ("192.0.2.10", 4321),
+                "server": ("testserver", 80),
+                "scheme": "http",
+            }
+        )
+        token = request_ctx.set(
+            RequestContext(
+                request_id="rpc-123",
+                meta=None,
+                session=None,
+                lifespan_context=None,
+                request=request,
+            )
+        )
+        try:
+            wrapped = make_logged_invoke("context_tool", ok_fn)
+            with caplog.at_level(logging.INFO):
+                result = await wrapped()
+                nested_logger.info("Outside invocation")
+        finally:
+            request_ctx.reset(token)
+
+        assert result == "ok"
+        nested_records = [
+            r for r in caplog.records if "Nested tool log" in str(r.message)
+        ]
+        assert len(nested_records) == 1
+        nested_message = str(nested_records[0].message)
+        assert "session-abc" in nested_message
+        assert "rpc-123" in nested_message
+        assert "context_tool" in nested_message
+        assert "tool_invocation_id" in nested_message
+
+        outside_records = [
+            r for r in caplog.records if "Outside invocation" in str(r.message)
+        ]
+        assert len(outside_records) == 1
+        outside_message = str(outside_records[0].message)
+        assert "session-abc" not in outside_message
+        assert "tool_invocation_id" not in outside_message

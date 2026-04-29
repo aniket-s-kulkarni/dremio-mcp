@@ -105,6 +105,7 @@ def configure(enable_json_logging=None, to_file=False):
         else structlog.dev.ConsoleRenderer()
     )
     processors = [
+        structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(),
         structlog.stdlib.filter_by_level,
