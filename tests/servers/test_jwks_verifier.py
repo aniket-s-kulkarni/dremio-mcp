@@ -331,6 +331,41 @@ class TestMCPTransportLoggingMiddleware:
         assert "203.0.113.10" in logged
         assert "secret-token" not in logged
 
+    @pytest.mark.asyncio
+    async def test_logs_redirects(self, caplog):
+        async def app(scope, receive, send):
+            response = Response(status_code=307, headers={"location": "/mcp/new"})
+            await response(scope, receive, send)
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/mcp/project-123",
+            "headers": [],
+            "client": ("203.0.113.10", 4321),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "query_string": b"",
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message):
+            pass
+
+        middleware = MCPTransportLoggingMiddleware(app)
+        with caplog.at_level(logging.WARNING):
+            await middleware(scope, receive, send)
+
+        warning_messages = [
+            str(r.message) for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any(
+            "MCP transport request failed" in msg and "307" in msg
+            for msg in warning_messages
+        )
+
 
 class TestStreamableHttpInit:
     def test_streamable_http_transport_is_stateless(self):

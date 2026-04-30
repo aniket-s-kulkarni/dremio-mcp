@@ -23,6 +23,7 @@ import time
 from uuid import uuid4
 from enum import StrEnum, auto
 from functools import reduce, wraps
+from http import HTTPStatus
 from json import dump as jdump
 from json import load
 from operator import ior
@@ -54,6 +55,7 @@ from pydantic import AnyHttpUrl
 from pydantic.networks import AnyUrl
 from rich import console, table
 from rich import print as pp
+from starlette.datastructures import Headers
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
@@ -78,6 +80,7 @@ from dremioai.tools.tools import ProjectIdMiddleware
 
 class MCPTransportLoggingMiddleware:
     logger = log.logger("MCPTransportLoggingMiddleware")
+    status_to_log = HTTPStatus.MULTIPLE_CHOICES  # log 300 and above
     max_error_body_log_bytes = 2048
 
     def __init__(self, app: ASGIApp):
@@ -102,7 +105,7 @@ class MCPTransportLoggingMiddleware:
             elif (
                 message["type"] == "http.response.body"
                 and status_code is not None
-                and status_code >= 400
+                and status_code >= self.status_to_log
             ):
                 body = message.get("body", b"")
                 remaining = self.max_error_body_log_bytes - len(captured_body)
@@ -122,7 +125,7 @@ class MCPTransportLoggingMiddleware:
             )
             raise
 
-        if status_code is not None and status_code >= 400:
+        if status_code is not None and status_code >= self.status_to_log:
             response_body = (
                 captured_body.decode("utf-8", errors="replace").strip()
                 if captured_body
@@ -133,19 +136,11 @@ class MCPTransportLoggingMiddleware:
                 status_code=status_code,
                 response_body=response_body,
                 response_body_truncated=response_body_truncated,
-                response_mcp_session_id=self._header(
-                    response_headers, MCP_SESSION_ID_HEADER
+                response_mcp_session_id=Headers(raw=response_headers).get(
+                    MCP_SESSION_ID_HEADER
                 ),
                 **self._request_log_context(request),
             )
-
-    @staticmethod
-    def _header(headers: List[Tuple[bytes, bytes]], name: str) -> str | None:
-        expected = name.lower().encode()
-        for key, value in headers:
-            if key.lower() == expected:
-                return value.decode("utf-8", errors="replace")
-        return None
 
     @staticmethod
     def _request_log_context(request: Request) -> Dict[str, Any]:
