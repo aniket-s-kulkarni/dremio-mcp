@@ -59,6 +59,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.responses import Response as StarletteResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from structlog.contextvars import bound_contextvars
 from typer import Argument, BadParameter, Option, Typer
 from yaml import dump
@@ -73,6 +74,92 @@ from dremioai.metrics.tool_metrics import invocation_counter, invocation_duratio
 from dremioai.servers.jwks_verifier import JWKSVerifier, TokenExpiredError
 from dremioai.tools import tools
 from dremioai.tools.tools import ProjectIdMiddleware
+
+
+class MCPTransportLoggingMiddleware:
+    logger = log.logger("MCPTransportLoggingMiddleware")
+    max_error_body_log_bytes = 2048
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/mcp"):
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        status_code = None
+        response_headers: List[Tuple[bytes, bytes]] = []
+        captured_body = bytearray()
+        response_body_truncated = False
+
+        async def send_wrapper(message: Message):
+            nonlocal status_code, response_headers, response_body_truncated
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+            elif (
+                message["type"] == "http.response.body"
+                and status_code is not None
+                and status_code >= 400
+            ):
+                body = message.get("body", b"")
+                remaining = self.max_error_body_log_bytes - len(captured_body)
+                if remaining > 0:
+                    captured_body.extend(body[:remaining])
+                if len(body) > remaining:
+                    response_body_truncated = True
+
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            self.logger.exception(
+                "MCP transport request failed with exception",
+                **self._request_log_context(request),
+            )
+            raise
+
+        if status_code is not None and status_code >= 400:
+            response_body = (
+                captured_body.decode("utf-8", errors="replace").strip()
+                if captured_body
+                else None
+            )
+            self.logger.warning(
+                "MCP transport request failed",
+                status_code=status_code,
+                response_body=response_body,
+                response_body_truncated=response_body_truncated,
+                response_mcp_session_id=self._header(
+                    response_headers, MCP_SESSION_ID_HEADER
+                ),
+                **self._request_log_context(request),
+            )
+
+    @staticmethod
+    def _header(headers: List[Tuple[bytes, bytes]], name: str) -> str | None:
+        expected = name.lower().encode()
+        for key, value in headers:
+            if key.lower() == expected:
+                return value.decode("utf-8", errors="replace")
+        return None
+
+    @staticmethod
+    def _request_log_context(request: Request) -> Dict[str, Any]:
+        context = {
+            "method": request.method,
+            "path": request.url.path,
+            "client": request.client.host if request.client else None,
+            "mcp_session_id": request.headers.get(MCP_SESSION_ID_HEADER),
+            "mcp_protocol_version": request.headers.get(MCP_PROTOCOL_VERSION_HEADER),
+            "accept": request.headers.get("accept"),
+            "content_type": request.headers.get("content-type"),
+            "project_id": ProjectIdMiddleware.get_project_id(),
+        }
+        return {key: value for key, value in context.items() if value is not None}
 
 
 class RequireAuthWithWWWAuthenticateMiddleware(BaseHTTPMiddleware):
@@ -208,6 +295,7 @@ class FastMCPServerWithAuthToken(FastMCP):
         else:
             token_verifier = FastMCPServerWithAuthToken.DelegatingTokenVerifier()
         app = super().streamable_http_app()
+        app.add_middleware(MCPTransportLoggingMiddleware)
         app.add_middleware(RequireAuthWithWWWAuthenticateMiddleware)
         app.add_middleware(AuthContextMiddleware)
         app.add_middleware(
@@ -319,6 +407,8 @@ def init(
         f"Initializing MCP server with mode={mode}, mock={mock}, class={mcp_cls.__name__}"
     )
     opts = {"log_level": "DEBUG", "debug": True, "lifespan": _server_lifespan}
+    if transport == Transports.streamable_http:
+        opts["stateless_http"] = True
     if port is not None:
         opts["port"] = port
     if host is not None:

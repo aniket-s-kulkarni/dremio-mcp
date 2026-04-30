@@ -31,10 +31,17 @@ from mcp.server.streamable_http import (
 )
 from mcp.shared.context import RequestContext
 from starlette.requests import Request
+from starlette.responses import Response
 
 from dremioai import log
 from dremioai.servers.jwks_verifier import JWKSVerifier, VerifiedClaims, TokenExpiredError
-from dremioai.servers.mcp import make_logged_invoke, RequireAuthWithWWWAuthenticateMiddleware
+from dremioai.servers.mcp import (
+    MCPTransportLoggingMiddleware,
+    Transports,
+    init,
+    make_logged_invoke,
+    RequireAuthWithWWWAuthenticateMiddleware,
+)
 
 JWKS_DECODE = "dremioai.servers.jwks_verifier.pyjwt.decode"
 
@@ -270,6 +277,75 @@ class TestDispatchWarning:
             "/mcp/tools" in str(r.message) or "192.168.1.1" in str(r.message)
             for r in warning_records
         )
+
+
+class TestMCPTransportLoggingMiddleware:
+    @pytest.mark.asyncio
+    async def test_logs_transport_error_context(self, caplog):
+        async def app(scope, receive, send):
+            response = Response(
+                "Bad Request: Unsupported protocol version: 2025-11-25",
+                status_code=400,
+                headers={MCP_SESSION_ID_HEADER: "response-session"},
+            )
+            await response(scope, receive, send)
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/mcp/project-123",
+            "headers": [
+                (MCP_SESSION_ID_HEADER.encode(), b"request-session"),
+                (MCP_PROTOCOL_VERSION_HEADER.encode(), b"2025-11-25"),
+                (b"accept", b"application/json, text/event-stream"),
+                (b"content-type", b"application/json"),
+                (b"authorization", b"Bearer secret-token"),
+            ],
+            "client": ("203.0.113.10", 4321),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "query_string": b"",
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        sent_messages = []
+
+        async def send(message):
+            sent_messages.append(message)
+
+        middleware = MCPTransportLoggingMiddleware(app)
+        with caplog.at_level(logging.WARNING):
+            await middleware(scope, receive, send)
+
+        warning_messages = [
+            str(r.message) for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any("MCP transport request failed" in msg for msg in warning_messages)
+        logged = "\n".join(warning_messages)
+        assert "request-session" in logged
+        assert "response-session" in logged
+        assert "2025-11-25" in logged
+        assert "Unsupported protocol version" in logged
+        assert "203.0.113.10" in logged
+        assert "secret-token" not in logged
+
+
+class TestStreamableHttpInit:
+    def test_streamable_http_transport_is_stateless(self):
+        with patch("dremioai.servers.mcp.tools.get_tools", return_value=[]), patch(
+            "dremioai.servers.mcp.tools.get_resources", return_value=[]
+        ):
+            mcp = init(
+                mode=None,
+                transport=Transports.streamable_http,
+                host="127.0.0.1",
+                port=8000,
+                mock=True,
+            )
+
+        assert mcp.settings.stateless_http is True
 
 
 class TestMakeLoggedInvoke:
