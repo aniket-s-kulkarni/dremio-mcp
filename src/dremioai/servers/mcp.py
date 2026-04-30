@@ -20,8 +20,10 @@ import os
 import sys
 import threading
 import time
+from uuid import uuid4
 from enum import StrEnum, auto
 from functools import reduce, wraps
+from http import HTTPStatus
 from json import dump as jdump
 from json import load
 from operator import ior
@@ -34,22 +36,33 @@ import uvicorn
 from click import Choice
 from mcp.cli.claude import get_claude_config_path
 from mcp.server.auth.json_response import PydanticJSONResponse
-from mcp.server.auth.middleware.auth_context import AuthContextMiddleware, get_access_token
+from mcp.server.auth.middleware.auth_context import (
+    AuthContextMiddleware,
+    get_access_token,
+)
 from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.prompts import Prompt
 from mcp.server.fastmcp.resources import FunctionResource
+from mcp.server.lowlevel.server import request_ctx
+from mcp.server.streamable_http import (
+    MCP_PROTOCOL_VERSION_HEADER,
+    MCP_SESSION_ID_HEADER,
+)
 from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
 from pydantic.networks import AnyUrl
 from rich import console, table
 from rich import print as pp
+from starlette.datastructures import Headers
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.responses import Response as StarletteResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from structlog.contextvars import bound_contextvars
 from typer import Argument, BadParameter, Option, Typer
 from yaml import dump
 
@@ -63,6 +76,85 @@ from dremioai.metrics.tool_metrics import invocation_counter, invocation_duratio
 from dremioai.servers.jwks_verifier import JWKSVerifier, TokenExpiredError
 from dremioai.tools import tools
 from dremioai.tools.tools import ProjectIdMiddleware
+
+
+class MCPTransportLoggingMiddleware:
+    logger = log.logger("MCPTransportLoggingMiddleware")
+    status_to_log = HTTPStatus.MULTIPLE_CHOICES  # log 300 and above
+    max_error_body_log_bytes = 2048
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/mcp"):
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        status_code = None
+        response_headers: List[Tuple[bytes, bytes]] = []
+        captured_body = bytearray()
+        response_body_truncated = False
+
+        async def send_wrapper(message: Message):
+            nonlocal status_code, response_headers, response_body_truncated
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+            elif (
+                message["type"] == "http.response.body"
+                and status_code is not None
+                and status_code >= self.status_to_log
+            ):
+                body = message.get("body", b"")
+                remaining = self.max_error_body_log_bytes - len(captured_body)
+                if remaining > 0:
+                    captured_body.extend(body[:remaining])
+                if len(body) > remaining:
+                    response_body_truncated = True
+
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            self.logger.exception(
+                "MCP transport request failed with exception",
+                **self._request_log_context(request),
+            )
+            raise
+
+        if status_code is not None and status_code >= self.status_to_log:
+            response_body = (
+                captured_body.decode("utf-8", errors="replace").strip()
+                if captured_body
+                else None
+            )
+            self.logger.warning(
+                "MCP transport request failed",
+                status_code=status_code,
+                response_body=response_body,
+                response_body_truncated=response_body_truncated,
+                response_mcp_session_id=Headers(raw=response_headers).get(
+                    MCP_SESSION_ID_HEADER
+                ),
+                **self._request_log_context(request),
+            )
+
+    @staticmethod
+    def _request_log_context(request: Request) -> Dict[str, Any]:
+        context = {
+            "method": request.method,
+            "path": request.url.path,
+            "client": request.client.host if request.client else None,
+            "mcp_session_id": request.headers.get(MCP_SESSION_ID_HEADER),
+            "mcp_protocol_version": request.headers.get(MCP_PROTOCOL_VERSION_HEADER),
+            "accept": request.headers.get("accept"),
+            "content_type": request.headers.get("content-type"),
+            "project_id": ProjectIdMiddleware.get_project_id(),
+        }
+        return {key: value for key, value in context.items() if value is not None}
 
 
 class RequireAuthWithWWWAuthenticateMiddleware(BaseHTTPMiddleware):
@@ -198,6 +290,7 @@ class FastMCPServerWithAuthToken(FastMCP):
         else:
             token_verifier = FastMCPServerWithAuthToken.DelegatingTokenVerifier()
         app = super().streamable_http_app()
+        app.add_middleware(MCPTransportLoggingMiddleware)
         app.add_middleware(RequireAuthWithWWWAuthenticateMiddleware)
         app.add_middleware(AuthContextMiddleware)
         app.add_middleware(
@@ -229,20 +322,67 @@ def _make_mock_invoke(tool_class_name: str, original_doc: str):
     return mock_invoke
 
 
+def _mcp_request_log_context() -> Dict[str, Any]:
+    try:
+        ctx = request_ctx.get()
+    except LookupError:
+        return {}
+
+    request = getattr(ctx, "request", None)
+    log_context: Dict[str, Any] = {
+        "jsonrpc_request_id": str(ctx.request_id),
+    }
+    if request is not None:
+        log_context.update(
+            {
+                "mcp_session_id": request.headers.get(MCP_SESSION_ID_HEADER),
+                "mcp_protocol_version": request.headers.get(
+                    MCP_PROTOCOL_VERSION_HEADER
+                ),
+                "client": request.client.host if request.client else None,
+                "method": request.method,
+                "path": request.url.path,
+            }
+        )
+
+    if project_id := ProjectIdMiddleware.get_project_id():
+        log_context["project_id"] = project_id
+
+    if isinstance((token := get_access_token()), AccessToken):
+        log_context["user_id"] = token.client_id
+
+    return {key: value for key, value in log_context.items() if value is not None}
+
+
 def make_logged_invoke(tool_name: str, fn):
     _log = log.logger("tool_invoke")
 
     @wraps(fn)
     async def _wrapper(*args, **kwargs):
-        try:
-            return await fn(*args, **kwargs)
-        except Exception as exc:
-            _log.warning(
-                "Tool invocation raised an exception",
-                tool=tool_name,
-                error=str(exc),
-            )
-            raise
+        started = time.perf_counter()
+        log_context = {
+            **_mcp_request_log_context(),
+            "tool": tool_name,
+            "tool_invocation_id": str(uuid4()),
+        }
+        with bound_contextvars(**log_context):
+            try:
+                result = await fn(*args, **kwargs)
+                _log.info(
+                    "Tool invocation completed",
+                    outcome="success",
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                )
+                return result
+            except Exception as exc:
+                _log.warning(
+                    "Tool invocation raised an exception",
+                    outcome="error",
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                raise
 
     return _wrapper
 
@@ -262,6 +402,8 @@ def init(
         f"Initializing MCP server with mode={mode}, mock={mock}, class={mcp_cls.__name__}"
     )
     opts = {"log_level": "DEBUG", "debug": True, "lifespan": _server_lifespan}
+    if transport == Transports.streamable_http:
+        opts["stateless_http"] = True
     if port is not None:
         opts["port"] = port
     if host is not None:
@@ -295,13 +437,15 @@ def init(
         tool_instance = tool()
         is_sql_tool = tool is tools.RunSqlQuery
         if mock:
-            invoke_fn = _make_mock_invoke(
-                tool.__name__, tool_instance.invoke.__doc__
-            )
+            invoke_fn = _make_mock_invoke(tool.__name__, tool_instance.invoke.__doc__)
         else:
             invoke_fn = tool_instance.invoke
         mcp.add_tool(
-            invoke_fn if mock else make_logged_invoke(tool.__name__, tool_instance.invoke),
+            (
+                invoke_fn
+                if mock
+                else make_logged_invoke(tool.__name__, tool_instance.invoke)
+            ),
             name=tool.__name__,
             description=tool_instance.invoke.__doc__,
             annotations=ToolAnnotations(
