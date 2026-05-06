@@ -48,7 +48,7 @@ from yaml import add_representer, dump
 from functools import reduce
 from operator import ior
 from shutil import which
-from contextvars import ContextVar, copy_context
+from contextvars import ContextVar
 from os import environ
 from importlib.util import find_spec
 from datetime import datetime
@@ -578,7 +578,6 @@ async def run_with(
         finally:
             _settings.reset(tok)
 
-    ctx = copy_context()
     return await _call()
 
 
