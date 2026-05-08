@@ -92,6 +92,7 @@ class MCPTransportLoggingMiddleware:
             return
 
         request = Request(scope)
+        started = time.perf_counter()
         status_code = None
         response_headers: List[Tuple[bytes, bytes]] = []
         captured_body = bytearray()
@@ -121,26 +122,34 @@ class MCPTransportLoggingMiddleware:
         except Exception:
             self.logger.exception(
                 "MCP transport request failed with exception",
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
                 **self._request_log_context(request),
             )
             raise
 
-        if status_code is not None and status_code >= self.status_to_log:
-            response_body = (
-                captured_body.decode("utf-8", errors="replace").strip()
-                if captured_body
-                else None
-            )
-            self.logger.warning(
-                "MCP transport request failed",
-                status_code=status_code,
-                response_body=response_body,
-                response_body_truncated=response_body_truncated,
-                response_mcp_session_id=Headers(raw=response_headers).get(
+        if status_code is not None:
+            event = {
+                "status_code": status_code,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                "response_mcp_session_id": Headers(raw=response_headers).get(
                     MCP_SESSION_ID_HEADER
                 ),
                 **self._request_log_context(request),
-            )
+            }
+            if status_code >= self.status_to_log:
+                response_body = (
+                    captured_body.decode("utf-8", errors="replace").strip()
+                    if captured_body
+                    else None
+                )
+                self.logger.warning(
+                    "MCP transport request failed",
+                    response_body=response_body,
+                    response_body_truncated=response_body_truncated,
+                    **event,
+                )
+            else:
+                self.logger.info("MCP transport request completed", **event)
 
     @staticmethod
     def _request_log_context(request: Request) -> Dict[str, Any]:
@@ -290,21 +299,43 @@ class FastMCPServerWithAuthToken(FastMCP):
         else:
             token_verifier = FastMCPServerWithAuthToken.DelegatingTokenVerifier()
         app = super().streamable_http_app()
-        app.add_middleware(MCPTransportLoggingMiddleware)
         app.add_middleware(RequireAuthWithWWWAuthenticateMiddleware)
         app.add_middleware(AuthContextMiddleware)
         app.add_middleware(
             AuthenticationMiddleware, backend=BearerAuthBackend(token_verifier)
         )
-        # Add middleware in reverse order (last added = first executed)
+        # Starlette inserts middleware at the front, so the last added middleware
+        # runs first. Keep transport logging outermost so it observes auth 401s.
         if self.support_project_id_endpoints:
             # this means, dynamically allow endpoints
             # like ../mcp/{project_id}/..  and extract that project id as
             # context var
             app.add_middleware(ProjectIdMiddleware)
+        app.add_middleware(MCPTransportLoggingMiddleware)
 
         # Metrics are now served on a separate port, not mounted here
         return app
+
+    async def run_streamable_http_async(self) -> None:
+        """Run StreamableHTTP with Uvicorn access logs disabled.
+
+        FastMCP.run() dispatches here polymorphically for the streamable-http
+        transport, so overriding this method is enough to replace the base
+        Uvicorn configuration used by the CLI server path.
+
+        Access logging is handled by MCPTransportLoggingMiddleware so it can
+        share the application's structured logging pipeline.
+        """
+        starlette_app = self.streamable_http_app()
+        config = uvicorn.Config(
+            starlette_app,
+            host=self.settings.host,
+            port=self.settings.port,
+            log_level=self.settings.log_level.lower(),
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

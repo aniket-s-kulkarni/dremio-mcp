@@ -16,6 +16,7 @@
 
 import os
 import sys
+import io
 import json
 import pytest
 import logging
@@ -162,6 +163,36 @@ class TestLoggerConfiguration:
         # Should not raise any exceptions
         logger.info("Test JSON message", key="value")
         assert structlog.is_configured()
+
+    def test_stdlib_logs_are_rendered_as_json(self, capsys):
+        """Stdlib loggers should share the same JSON formatter pipeline."""
+        log.configure(enable_json_logging=True)
+        stream = io.StringIO()
+        logging.getLogger().handlers[0].setStream(stream)
+
+        logging.getLogger("uvicorn.access").info("Access log message")
+
+        record = json.loads(stream.getvalue().strip())
+        assert record["message"] == "Access log message"
+        assert record["logger"] == "uvicorn.access"
+        assert record["level"] == "info"
+
+    def test_exception_logs_use_json_stacktrace_field(self, capsys):
+        """Exception traces should be serialized into a structured stacktrace field."""
+        log.configure(enable_json_logging=True)
+        stream = io.StringIO()
+        logging.getLogger().handlers[0].setStream(stream)
+
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            logging.getLogger("uvicorn.error").exception("Request crashed")
+
+        record = json.loads(stream.getvalue().strip())
+        assert record["message"] == "Request crashed"
+        assert record["logger"] == "uvicorn.error"
+        assert "stacktrace" in record
+        assert "RuntimeError: boom" in record["stacktrace"]
 
     def test_configure_with_env_json_logging(self):
         """Test JSON logging enabled via environment variable"""

@@ -20,8 +20,10 @@ Tests for JWKSVerifier — JWKS-based JWT verification and claims extraction.
 import logging
 import time
 import pytest
+import structlog
 from unittest.mock import patch, MagicMock, AsyncMock
 
+import httpx
 import jwt as pyjwt
 from jwt import PyJWKClient, PyJWKClientError, ExpiredSignatureError
 from mcp.server.lowlevel.server import request_ctx
@@ -36,6 +38,7 @@ from starlette.responses import Response
 from dremioai import log
 from dremioai.servers.jwks_verifier import JWKSVerifier, VerifiedClaims, TokenExpiredError
 from dremioai.servers.mcp import (
+    FastMCPServerWithAuthToken,
     MCPTransportLoggingMiddleware,
     Transports,
     init,
@@ -50,6 +53,21 @@ JWKS_DECODE = "dremioai.servers.jwks_verifier.pyjwt.decode"
 def verifier():
     with patch.object(PyJWKClient, "__init__", return_value=None):
         return JWKSVerifier("https://example.com/.well-known/jwks.json")
+
+
+@pytest.fixture(autouse=True)
+def configure_logging():
+    structlog.reset_defaults()
+    log._level = None
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    log.configure(enable_json_logging=False, to_file=False)
+    yield
+    structlog.reset_defaults()
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
 
 
 @pytest.fixture
@@ -246,6 +264,30 @@ class TestTokenExpiryBuffer:
         assert any("JWKS verify" in msg for msg in warning_messages)
 
 
+class TestStreamableHttpLogging:
+    @pytest.mark.asyncio
+    async def test_run_streamable_http_disables_uvicorn_access_logs(self):
+        server = FastMCPServerWithAuthToken(
+            "test-server",
+            host="127.0.0.1",
+            port=8765,
+            log_level="INFO",
+            stateless_http=True,
+        )
+        server._mock_token_verifier = MagicMock()
+
+        mock_uvicorn_server = MagicMock()
+        mock_uvicorn_server.serve = AsyncMock()
+
+        with patch("dremioai.servers.mcp.uvicorn.Config") as mock_config, patch(
+            "dremioai.servers.mcp.uvicorn.Server", return_value=mock_uvicorn_server
+        ):
+            await server.run_streamable_http_async()
+
+        assert mock_config.call_args.kwargs["access_log"] is False
+        mock_uvicorn_server.serve.assert_awaited_once()
+
+
 class TestDispatchWarning:
     """Tests for RequireAuthWithWWWAuthenticateMiddleware.dispatch() WARNING logging."""
 
@@ -381,6 +423,34 @@ class TestStreamableHttpInit:
             )
 
         assert mcp.settings.stateless_http is True
+
+    @pytest.mark.asyncio
+    async def test_transport_logging_wraps_unauthorized_responses(self, caplog):
+        with patch("dremioai.servers.mcp.tools.get_tools", return_value=[]), patch(
+            "dremioai.servers.mcp.tools.get_resources", return_value=[]
+        ):
+            mcp = init(
+                mode=None,
+                transport=Transports.streamable_http,
+                host="127.0.0.1",
+                port=8000,
+                mock=True,
+            )
+
+        app = mcp.streamable_http_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            with caplog.at_level(logging.INFO):
+                response = await client.post("/mcp")
+
+        assert response.status_code == 401
+        messages = [str(r.message) for r in caplog.records if r.levelno >= logging.INFO]
+        assert any("Unauthorized request rejected" in msg for msg in messages)
+        assert any(
+            "MCP transport request failed" in msg and "401" in msg for msg in messages
+        )
 
 
 class TestMakeLoggedInvoke:

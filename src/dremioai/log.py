@@ -20,7 +20,6 @@ import os
 import sys
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
-from logging import basicConfig
 
 
 def get_log_directory(app_name: str = "dremioai") -> Path:
@@ -57,6 +56,13 @@ def logger(name=None):
 
 
 _level = None
+
+
+def _rename_exception_field(_logger, _name, event_dict):
+    """Use stacktrace for JSON logs to keep exception payloads machine-friendly."""
+    if (exception := event_dict.pop("exception", None)) is not None:
+        event_dict["stacktrace"] = exception
+    return event_dict
 
 
 def configure_file_logging(enable_json=False):
@@ -104,13 +110,11 @@ def configure(enable_json_logging=None, to_file=False):
         if enable_json_logging
         else structlog.dev.ConsoleRenderer()
     )
-    processors = [
+    shared_processors = [
         structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(),
-        structlog.stdlib.filter_by_level,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
+        structlog.stdlib.ExtraAdder(),
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
@@ -121,11 +125,30 @@ def configure(enable_json_logging=None, to_file=False):
                 structlog.processors.CallsiteParameter.LINENO,
             }
         ),
+    ]
+    formatter_processors = [
+        structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+    ]
+    if enable_json_logging:
+        formatter_processors.append(_rename_exception_field)
+    formatter_processors.extend(
+        [
         structlog.processors.EventRenamer("message"),
         renderer,
-    ]
+        ]
+    )
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            processors=formatter_processors,
+            foreign_pre_chain=shared_processors,
+        )
+    )
     structlog.configure(
-        processors=processors,
+        processors=[
+            structlog.stdlib.filter_by_level,
+            *shared_processors,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
         context_class=dict,
         wrapper_class=structlog.stdlib.BoundLogger,
         logger_factory=(structlog.stdlib.LoggerFactory()),
