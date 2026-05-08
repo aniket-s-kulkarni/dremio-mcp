@@ -20,6 +20,7 @@ Tests for JWKSVerifier — JWKS-based JWT verification and claims extraction.
 import logging
 import time
 import pytest
+import structlog
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import jwt as pyjwt
@@ -36,6 +37,7 @@ from starlette.responses import Response
 from dremioai import log
 from dremioai.servers.jwks_verifier import JWKSVerifier, VerifiedClaims, TokenExpiredError
 from dremioai.servers.mcp import (
+    FastMCPServerWithAuthToken,
     MCPTransportLoggingMiddleware,
     Transports,
     init,
@@ -50,6 +52,21 @@ JWKS_DECODE = "dremioai.servers.jwks_verifier.pyjwt.decode"
 def verifier():
     with patch.object(PyJWKClient, "__init__", return_value=None):
         return JWKSVerifier("https://example.com/.well-known/jwks.json")
+
+
+@pytest.fixture(autouse=True)
+def configure_logging():
+    structlog.reset_defaults()
+    log._level = None
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    log.configure(enable_json_logging=False, to_file=False)
+    yield
+    structlog.reset_defaults()
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
 
 
 @pytest.fixture
@@ -244,6 +261,30 @@ class TestTokenExpiryBuffer:
         assert result is None
         warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert any("JWKS verify" in msg for msg in warning_messages)
+
+
+class TestStreamableHttpLogging:
+    @pytest.mark.asyncio
+    async def test_run_streamable_http_disables_uvicorn_access_logs(self):
+        server = FastMCPServerWithAuthToken(
+            "test-server",
+            host="127.0.0.1",
+            port=8765,
+            log_level="INFO",
+            stateless_http=True,
+        )
+        server._mock_token_verifier = MagicMock()
+
+        mock_uvicorn_server = MagicMock()
+        mock_uvicorn_server.serve = AsyncMock()
+
+        with patch("dremioai.servers.mcp.uvicorn.Config") as mock_config, patch(
+            "dremioai.servers.mcp.uvicorn.Server", return_value=mock_uvicorn_server
+        ):
+            await server.run_streamable_http_async()
+
+        assert mock_config.call_args.kwargs["access_log"] is False
+        mock_uvicorn_server.serve.assert_awaited_once()
 
 
 class TestDispatchWarning:

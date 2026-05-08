@@ -163,6 +163,32 @@ class TestLoggerConfiguration:
         logger.info("Test JSON message", key="value")
         assert structlog.is_configured()
 
+    def test_stdlib_logs_are_rendered_as_json(self, capsys):
+        """Stdlib loggers should share the same JSON formatter pipeline."""
+        log.configure(enable_json_logging=True)
+
+        logging.getLogger("uvicorn.access").info("Access log message")
+
+        record = json.loads(capsys.readouterr().err.strip())
+        assert record["message"] == "Access log message"
+        assert record["logger"] == "uvicorn.access"
+        assert record["level"] == "info"
+
+    def test_exception_logs_use_json_stacktrace_field(self, capsys):
+        """Exception traces should be serialized into a structured stacktrace field."""
+        log.configure(enable_json_logging=True)
+
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            logging.getLogger("uvicorn.error").exception("Request crashed")
+
+        record = json.loads(capsys.readouterr().err.strip())
+        assert record["message"] == "Request crashed"
+        assert record["logger"] == "uvicorn.error"
+        assert "stacktrace" in record
+        assert "RuntimeError: boom" in record["stacktrace"]
+
     def test_configure_with_env_json_logging(self):
         """Test JSON logging enabled via environment variable"""
         with patch.dict(os.environ, {"JSON_LOGGING": "1"}):
