@@ -23,6 +23,7 @@ import pytest
 import structlog
 from unittest.mock import patch, MagicMock, AsyncMock
 
+import httpx
 import jwt as pyjwt
 from jwt import PyJWKClient, PyJWKClientError, ExpiredSignatureError
 from mcp.server.lowlevel.server import request_ctx
@@ -422,6 +423,34 @@ class TestStreamableHttpInit:
             )
 
         assert mcp.settings.stateless_http is True
+
+    @pytest.mark.asyncio
+    async def test_transport_logging_wraps_unauthorized_responses(self, caplog):
+        with patch("dremioai.servers.mcp.tools.get_tools", return_value=[]), patch(
+            "dremioai.servers.mcp.tools.get_resources", return_value=[]
+        ):
+            mcp = init(
+                mode=None,
+                transport=Transports.streamable_http,
+                host="127.0.0.1",
+                port=8000,
+                mock=True,
+            )
+
+        app = mcp.streamable_http_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            with caplog.at_level(logging.INFO):
+                response = await client.post("/mcp")
+
+        assert response.status_code == 401
+        messages = [str(r.message) for r in caplog.records if r.levelno >= logging.INFO]
+        assert any("Unauthorized request rejected" in msg for msg in messages)
+        assert any(
+            "MCP transport request failed" in msg and "401" in msg for msg in messages
+        )
 
 
 class TestMakeLoggedInvoke:

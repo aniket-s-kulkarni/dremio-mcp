@@ -299,18 +299,19 @@ class FastMCPServerWithAuthToken(FastMCP):
         else:
             token_verifier = FastMCPServerWithAuthToken.DelegatingTokenVerifier()
         app = super().streamable_http_app()
-        app.add_middleware(MCPTransportLoggingMiddleware)
         app.add_middleware(RequireAuthWithWWWAuthenticateMiddleware)
         app.add_middleware(AuthContextMiddleware)
         app.add_middleware(
             AuthenticationMiddleware, backend=BearerAuthBackend(token_verifier)
         )
-        # Add middleware in reverse order (last added = first executed)
+        # Starlette inserts middleware at the front, so the last added middleware
+        # runs first. Keep transport logging outermost so it observes auth 401s.
         if self.support_project_id_endpoints:
             # this means, dynamically allow endpoints
             # like ../mcp/{project_id}/..  and extract that project id as
             # context var
             app.add_middleware(ProjectIdMiddleware)
+        app.add_middleware(MCPTransportLoggingMiddleware)
 
         # Metrics are now served on a separate port, not mounted here
         return app
