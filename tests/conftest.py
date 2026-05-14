@@ -53,9 +53,9 @@ from prometheus_client import CollectorRegistry
 
 @pytest.fixture(autouse=True)
 def reset_settings_state():
-    settings._reset_state_for_tests()
+    settings.reset_state_for_tests()
     yield
-    settings._reset_state_for_tests()
+    settings.reset_state_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -143,7 +143,7 @@ def mock_settings_instance():
             "tools": {"server_mode": ToolType.FOR_SELF.name},
         }
     )
-    settings._set_base_settings(config)
+    settings.set_base_settings(config)
     yield settings.instance()
 
 
@@ -251,7 +251,7 @@ async def http_streamable_mcp_server(
             config["dremio"]["wlm"] = {"engine_name": wlm_engine}
         if dremio_overrides:
             config["dremio"].update(dremio_overrides)
-        settings._set_base_settings(settings.Settings.model_validate(config))
+        settings.set_base_settings(settings.Settings.model_validate(config))
         settings.write_settings()
 
         set_level(logging_level.upper())
@@ -287,7 +287,7 @@ async def http_streamable_mcp_server(
         if sf is not None:
             sf.close()
         print(f"{sf} closed")
-        settings._set_base_settings(old)
+        settings.set_base_settings(old)
 
 
 @contextlib.asynccontextmanager
