@@ -80,6 +80,7 @@ from dremioai.config.feature_flags import FeatureFlagManager
 from dremioai.metrics.registry import get_metrics_app
 from dremioai.metrics.tool_metrics import invocation_counter, invocation_duration
 from dremioai.servers.jwks_verifier import JWKSVerifier, TokenExpiredError
+from dremioai.servers.oauth_dcr import proxy_register_request
 from dremioai.tools import tools
 from dremioai.tools.tools import ProjectIdMiddleware, secured
 
@@ -181,7 +182,14 @@ class RequireAuthWithWWWAuthenticateMiddleware(BaseHTTPMiddleware):
 
     logger = log.logger("RequireAuthWithWWWAuthenticateMiddleware")
 
+    @staticmethod
+    def _is_public_well_known_path(path: str) -> bool:
+        return path.startswith("/mcp/") and "/.well-known/" in path
+
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        if self._is_public_well_known_path(request.url.path):
+            return await call_next(request)
+
         # Check if user is authenticated (request.user is available after AuthenticationMiddleware)
         if (
             not hasattr(request, "user")
@@ -304,6 +312,22 @@ def build_authorization_server_metadata() -> OAuthMetadataRFC8414 | None:
             token_endpoint_auth_methods_supported=["none"],
         )
     return None
+
+
+def build_local_registration_metadata(
+    request: Request, auth_metadata: OAuthMetadataRFC8414
+) -> OAuthMetadataRFC8414:
+    return OAuthMetadataRFC8414(
+        issuer=auth_metadata.issuer,
+        authorization_endpoint=auth_metadata.authorization_endpoint,
+        token_endpoint=auth_metadata.token_endpoint,
+        registration_endpoint=AnyHttpUrl(f"{request_base_url(request)}/oauth/register"),
+        scopes_supported=auth_metadata.scopes_supported,
+        response_types_supported=auth_metadata.response_types_supported,
+        grant_types_supported=auth_metadata.grant_types_supported,
+        code_challenge_methods_supported=auth_metadata.code_challenge_methods_supported,
+        token_endpoint_auth_methods_supported=auth_metadata.token_endpoint_auth_methods_supported,
+    )
 
 
 def build_protected_resource_metadata(
@@ -627,13 +651,14 @@ def init(
     host: str = "127.0.0.1",
     support_project_id_endpoints: bool = False,
     mock: bool = False,
+    auth_debug: bool = False,
     mock_token_expiry: int = 3600,
     mock_refresh_token_expiry: int = 86400,
     disable_dns_rebinding_protection: bool = False,
 ) -> FastMCP:
     mcp_cls = FastMCP if transport == Transports.stdio else FastMCPServerWithAuthToken
     log.logger("init").info(
-        f"Initializing MCP server with mode={mode}, mock={mock}, class={mcp_cls.__name__}"
+        f"Initializing MCP server with mode={mode}, mock={mock}, auth_debug={auth_debug}, class={mcp_cls.__name__}"
     )
     opts = {"log_level": "DEBUG", "debug": True, "lifespan": _server_lifespan}
     if transport == Transports.streamable_http:
@@ -655,6 +680,9 @@ def init(
     mcp = mcp_cls("Dremio", **opts)
     if transport == Transports.streamable_http and support_project_id_endpoints:
         mcp.support_project_id_endpoints = support_project_id_endpoints
+
+    if mock and auth_debug:
+        raise ValueError("--mock and --auth-debug cannot be enabled together")
 
     # In mock mode, set up mock OAuth issuer and token verifier
     if mock:
@@ -726,7 +754,11 @@ def init(
         )
     )
 
-    if not mock:
+    if auth_debug:
+        from dremioai.servers.auth_debug import register_auth_debug_routes
+
+        register_auth_debug_routes(mcp)
+    elif not mock:
 
         # FastMCP can expose RFC 9728 metadata from `settings.auth.resource_server_url`,
         # but this server does not currently populate AuthSettings and also needs the
@@ -755,12 +787,21 @@ def init(
             )
 
         @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+        @mcp.custom_route("/mcp/.well-known/oauth-authorization-server", methods=["GET"])
         @mcp.custom_route(
             "/mcp/{project_id}/.well-known/oauth-authorization-server", methods=["GET"]
         )
         async def authorization_server_metadata(request: Request) -> Response:
             if md := build_authorization_server_metadata():
-                return PydanticJSONResponse(md)
+                return PydanticJSONResponse(build_local_registration_metadata(request, md))
+            return Response(status_code=404)
+
+        @mcp.custom_route("/oauth/register", methods=["POST"])
+        async def oauth_register(request: Request) -> Response:
+            if md := build_authorization_server_metadata():
+                return await proxy_register_request(
+                    request, str(md.registration_endpoint)
+                )
             return Response(status_code=404)
 
     @mcp.custom_route("/healthz", methods=["GET"])
@@ -900,6 +941,15 @@ def main(
         Optional[bool],
         Option(help="Run in mock mode for client sanity testing"),
     ] = False,
+    auth_debug: Annotated[
+        Optional[bool],
+        Option(
+            help=(
+                "Expose local OAuth discovery/token/register proxy endpoints and "
+                "log full upstream auth traffic for debugging"
+            )
+        ),
+    ] = False,
     mock_token_expiry: Annotated[
         Optional[int],
         Option(help="Mock mode: access token expiry in seconds"),
@@ -937,7 +987,9 @@ def main(
             initialize_ld=True,
         )
     else:
-        if enable_streaming_http:
+        if auth_debug:
+            transport = Transports.streamable_http
+        elif enable_streaming_http:
             transport = Transports.streamable_http
         else:
             transport = Transports.stdio
@@ -966,6 +1018,7 @@ def main(
         host=host,
         support_project_id_endpoints=True,
         mock=mock,
+        auth_debug=auth_debug,
         mock_token_expiry=mock_token_expiry,
         mock_refresh_token_expiry=mock_refresh_token_expiry,
         disable_dns_rebinding_protection=disable_dns_rebinding_protection,

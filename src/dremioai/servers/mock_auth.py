@@ -323,6 +323,7 @@ def register_mock_routes(mcp, issuer: MockJWTIssuer) -> None:
         return PydanticJSONResponse(md)
 
     @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+    @mcp.custom_route("/mcp/.well-known/oauth-authorization-server", methods=["GET"])
     @mcp.custom_route(
         "/mcp/{project_id}/.well-known/oauth-authorization-server", methods=["GET"]
     )
