@@ -15,6 +15,8 @@
 #
 
 import contextlib
+import gzip
+import logging
 import socket
 import uuid
 from typing import AsyncGenerator
@@ -25,7 +27,7 @@ import pytest
 from httpx import AsyncClient
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse
+from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 from dremioai.config import settings
@@ -57,7 +59,11 @@ class _UpstreamAuthState:
 
 
 @contextlib.asynccontextmanager
-async def auth_debug_server(project_id: str) -> AsyncGenerator[tuple[ServerFixture, _UpstreamAuthState], None]:
+async def auth_debug_server(
+    project_id: str,
+    auth_debug_log_headers: bool = False,
+    gzip_register_response: bool = False,
+) -> AsyncGenerator[tuple[ServerFixture, _UpstreamAuthState], None]:
     old = settings.instance()
     upstream_fixture = None
     mcp_fixture = None
@@ -102,6 +108,20 @@ async def auth_debug_server(project_id: str) -> AsyncGenerator[tuple[ServerFixtu
                     "headers": dict(request.headers),
                 }
             )
+            if gzip_register_response:
+                payload = (
+                    '{"client_id":"upstream-client","client_name":"'
+                    f'{body.get("client_name")}"}}'
+                ).encode("utf-8")
+                return Response(
+                    content=gzip.compress(payload),
+                    headers={
+                        "content-encoding": "gzip",
+                        "content-type": "application/json",
+                        "x-upstream-auth-debug": "register",
+                    },
+                    media_type="application/json",
+                )
             return JSONResponse(
                 {"client_id": "upstream-client", "client_name": body.get("client_name")},
                 headers={"x-upstream-auth-debug": "register"},
@@ -144,6 +164,7 @@ async def auth_debug_server(project_id: str) -> AsyncGenerator[tuple[ServerFixtu
             mode=settings.instance().tools.server_mode,
             support_project_id_endpoints=True,
             auth_debug=True,
+            auth_debug_log_headers=auth_debug_log_headers,
         )
         mcp_app = mcp.streamable_http_app()
         mcp_server, mcp_stop = start_server_with_app(
@@ -230,10 +251,13 @@ async def test_auth_debug_proxies_token_and_register_requests(mock_config_dir):
         )
 
         assert register_response.status_code == 200, register_response.text
-        assert register_response.json() == {
-            "client_id": "upstream-client",
-            "client_name": "debug-client",
-        }
+        register_json = register_response.json()
+        assert register_json["client_id"] == "upstream-client"
+        assert register_json["client_name"] == "debug-client"
+        assert isinstance(register_json["client_id_issued_at"], int)
+        assert register_json["application_type"] == "web"
+        assert "client_secret" not in register_json
+        assert register_json["client_secret_expires_at"] == 0
         assert register_response.headers["x-upstream-auth-debug"] == "register"
         assert upstream_state.register_requests == [
             {
@@ -272,6 +296,13 @@ async def test_auth_debug_normalizes_register_payload_for_claude(mock_config_dir
             )
 
         assert response.status_code == 200, response.text
+        response_json = response.json()
+        assert response_json["client_id"] == "upstream-client"
+        assert response_json["client_name"] == "Claude"
+        assert isinstance(response_json["client_id_issued_at"], int)
+        assert response_json["application_type"] == "web"
+        assert "client_secret" not in response_json
+        assert response_json["client_secret_expires_at"] == 0
         assert upstream_state.register_requests == [
             {
                 "json": {
@@ -285,6 +316,95 @@ async def test_auth_debug_normalizes_register_payload_for_claude(mock_config_dir
                 "headers": ANY,
             }
         ]
+
+
+@pytest.mark.asyncio
+async def test_auth_debug_does_not_log_headers_by_default(mock_config_dir, caplog):
+    project_id = str(uuid.uuid4())
+    caplog.set_level(logging.INFO, logger="dremioai.servers.auth_debug")
+
+    async with auth_debug_server(project_id) as (mcp_fixture, _):
+        parsed = urlparse(mcp_fixture.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        async with AsyncClient(follow_redirects=False) as client:
+            response = await client.post(
+                f"{origin}/oauth/register",
+                json={
+                    "client_name": "debug-client",
+                    "redirect_uris": ["http://localhost/callback"],
+                },
+                headers={"x-client-header": "register-debug"},
+            )
+
+    assert response.status_code == 200, response.text
+    proxy_records = [
+        record.msg
+        for record in caplog.records
+        if isinstance(record.msg, dict)
+        and record.msg.get("event")
+        in {"Auth debug proxy request", "Auth debug proxy response"}
+    ]
+    assert proxy_records
+    assert all("headers" not in record for record in proxy_records)
+
+
+@pytest.mark.asyncio
+async def test_auth_debug_logs_headers_when_enabled(mock_config_dir, caplog):
+    project_id = str(uuid.uuid4())
+    caplog.set_level(logging.INFO, logger="dremioai.servers.auth_debug")
+
+    async with auth_debug_server(
+        project_id, auth_debug_log_headers=True
+    ) as (mcp_fixture, _):
+        parsed = urlparse(mcp_fixture.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        async with AsyncClient(follow_redirects=False) as client:
+            response = await client.post(
+                f"{origin}/oauth/register",
+                json={
+                    "client_name": "debug-client",
+                    "redirect_uris": ["http://localhost/callback"],
+                },
+                headers={"x-client-header": "register-debug"},
+            )
+
+    assert response.status_code == 200, response.text
+    proxy_records = [
+        record.msg
+        for record in caplog.records
+        if isinstance(record.msg, dict)
+        and record.msg.get("event")
+        in {"Auth debug proxy request", "Auth debug proxy response"}
+    ]
+    assert proxy_records
+    assert all("headers" in record for record in proxy_records)
+
+
+@pytest.mark.asyncio
+async def test_auth_debug_register_strips_upstream_content_encoding(mock_config_dir):
+    project_id = str(uuid.uuid4())
+    async with auth_debug_server(
+        project_id, gzip_register_response=True
+    ) as (mcp_fixture, _):
+        parsed = urlparse(mcp_fixture.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        async with AsyncClient(follow_redirects=False) as client:
+            response = await client.post(
+                f"{origin}/oauth/register",
+                json={
+                    "client_name": "debug-client",
+                    "redirect_uris": ["http://localhost/callback"],
+                },
+            )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["client_id"] == "upstream-client"
+    assert "content-encoding" not in {
+        key.lower(): value for key, value in response.headers.items()
+    }
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,8 @@
 #
 
 import contextlib
+import gzip
+import logging
 import socket
 import uuid
 from typing import AsyncGenerator
@@ -25,7 +27,7 @@ import pytest
 from httpx import AsyncClient
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from dremioai.config import settings
@@ -42,7 +44,9 @@ def _reserve_local_port() -> int:
 
 
 @contextlib.asynccontextmanager
-async def oauth_register_proxy_server() -> AsyncGenerator[tuple[ServerFixture, list[dict]], None]:
+async def oauth_register_proxy_server(
+    gzip_register_response: bool = False,
+) -> AsyncGenerator[tuple[ServerFixture, list[dict]], None]:
     old = settings.instance()
     upstream_fixture = None
     mcp_fixture = None
@@ -62,6 +66,19 @@ async def oauth_register_proxy_server() -> AsyncGenerator[tuple[ServerFixture, l
                     "headers": dict(request.headers),
                 }
             )
+            if gzip_register_response:
+                body = gzip.compress(
+                    b'{"client_id":"upstream-client","client_name":"upstream-name"}'
+                )
+                return Response(
+                    content=body,
+                    headers={
+                        "content-encoding": "gzip",
+                        "content-type": "application/json",
+                        "x-upstream-register": "true",
+                    },
+                    media_type="application/json",
+                )
             return JSONResponse(
                 {"client_id": "upstream-client", "client_name": "upstream-name"},
                 headers={"x-upstream-register": "true"},
@@ -124,7 +141,9 @@ async def oauth_register_proxy_server() -> AsyncGenerator[tuple[ServerFixture, l
 @pytest.mark.asyncio
 async def test_oauth_metadata_advertises_local_register_and_proxies_request(
     mock_config_dir,
+    caplog,
 ):
+    caplog.set_level(logging.INFO, logger="dremioai.servers.oauth_dcr")
     async with oauth_register_proxy_server() as (mcp_fixture, register_requests):
         parsed = urlparse(mcp_fixture.url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -152,10 +171,13 @@ async def test_oauth_metadata_advertises_local_register_and_proxies_request(
         assert metadata["registration_endpoint"] == f"{origin}/oauth/register"
 
         assert register_response.status_code == 200, register_response.text
-        assert register_response.json() == {
-            "client_id": "upstream-client",
-            "client_name": "upstream-name",
-        }
+        register_json = register_response.json()
+        assert register_json["client_id"] == "upstream-client"
+        assert register_json["client_name"] == "upstream-name"
+        assert isinstance(register_json["client_id_issued_at"], int)
+        assert register_json["application_type"] == "web"
+        assert "client_secret" not in register_json
+        assert register_json["client_secret_expires_at"] == 0
         assert register_response.headers["x-upstream-register"] == "true"
         assert register_requests == [
             {
@@ -168,3 +190,38 @@ async def test_oauth_metadata_advertises_local_register_and_proxies_request(
             }
         ]
         assert register_requests[0]["headers"]["x-client-header"] == "register-proxy"
+        assert any(
+            isinstance(record.msg, dict)
+            and record.msg.get("event") == "OAuth register proxy request"
+            for record in caplog.records
+        )
+        assert any(
+            isinstance(record.msg, dict)
+            and record.msg.get("event") == "OAuth register proxy response"
+            for record in caplog.records
+        )
+
+
+@pytest.mark.asyncio
+async def test_oauth_register_proxy_strips_upstream_content_encoding(mock_config_dir):
+    async with oauth_register_proxy_server(
+        gzip_register_response=True
+    ) as (mcp_fixture, _):
+        parsed = urlparse(mcp_fixture.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        async with AsyncClient(follow_redirects=False) as client:
+            register_response = await client.post(
+                f"{origin}/oauth/register",
+                json={
+                    "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+                    "client_name": "Claude",
+                    "scope": "dremio.all offline_access",
+                },
+            )
+
+        assert register_response.status_code == 200, register_response.text
+        assert register_response.json()["client_id"] == "upstream-client"
+        assert "content-encoding" not in {
+            key.lower(): value for key, value in register_response.headers.items()
+        }

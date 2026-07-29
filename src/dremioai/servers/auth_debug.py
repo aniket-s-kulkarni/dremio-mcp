@@ -31,6 +31,7 @@ from dremioai.servers.mcp import (
     build_protected_resource_metadata,
     request_base_url,
 )
+from dremioai.servers.oauth_dcr import augment_register_response
 
 logger = log.logger(__name__)
 
@@ -46,6 +47,7 @@ _REGISTER_ALLOWED_FIELDS = {
 }
 _HOP_BY_HOP_HEADERS = {
     "connection",
+    "content-encoding",
     "content-length",
     "keep-alive",
     "proxy-authenticate",
@@ -123,7 +125,9 @@ def _normalize_register_request(
     return request_headers, normalized_body, payload, removed_fields
 
 
-async def _proxy_request(request: Request, upstream_url: str) -> Response:
+async def _proxy_request(
+    request: Request, upstream_url: str, log_headers: bool = False
+) -> Response:
     request_body = await request.body()
     request_headers = {
         key: value
@@ -146,17 +150,23 @@ async def _proxy_request(request: Request, upstream_url: str) -> Response:
                 forwarded_body=_truncate_bytes(request_body),
             )
 
-    logger.info(
-        "Auth debug proxy request",
-        method=request.method,
-        local_path=request.url.path,
-        upstream_url=upstream_url,
-        query_string=str(request.url.query),
-        headers=request_headers,
-        body=_truncate_bytes(request_body),
-        body_truncated=bool(request_body and len(request_body) > _MAX_LOG_BODY_BYTES),
-        normalized_register_fields_removed=removed_fields or None,
-    )
+    def _log_kwargs(include_headers: bool) -> dict[str, Any]:
+        event = {
+            "method": request.method,
+            "local_path": request.url.path,
+            "upstream_url": upstream_url,
+            "query_string": str(request.url.query),
+            "body": _truncate_bytes(request_body),
+            "body_truncated": bool(
+                request_body and len(request_body) > _MAX_LOG_BODY_BYTES
+            ),
+            "normalized_register_fields_removed": removed_fields or None,
+        }
+        if include_headers:
+            event["headers"] = request_headers
+        return event
+
+    logger.info("Auth debug proxy request", **_log_kwargs(log_headers))
 
     try:
         async with ClientSession() as session:
@@ -171,19 +181,25 @@ async def _proxy_request(request: Request, upstream_url: str) -> Response:
             ) as upstream_response:
                 response_body = await upstream_response.read()
                 response_headers = _response_headers(upstream_response.headers)
+                if request.url.path == "/oauth/register" and 200 <= upstream_response.status < 300:
+                    response_body, _ = augment_register_response(
+                        response_body, upstream_response.content_type
+                    )
 
-                logger.info(
-                    "Auth debug proxy response",
-                    method=request.method,
-                    local_path=request.url.path,
-                    upstream_url=upstream_url,
-                    status_code=upstream_response.status,
-                    headers=response_headers,
-                    body=_truncate_bytes(response_body),
-                    body_truncated=bool(
+                response_log = {
+                    "method": request.method,
+                    "local_path": request.url.path,
+                    "upstream_url": upstream_url,
+                    "status_code": upstream_response.status,
+                    "body": _truncate_bytes(response_body),
+                    "body_truncated": bool(
                         response_body and len(response_body) > _MAX_LOG_BODY_BYTES
                     ),
-                )
+                }
+                if log_headers:
+                    response_log["headers"] = response_headers
+
+                logger.info("Auth debug proxy response", **response_log)
 
                 return Response(
                     content=response_body,
@@ -215,7 +231,7 @@ def _build_local_authorization_server_metadata(
     )
 
 
-def register_auth_debug_routes(mcp) -> None:
+def register_auth_debug_routes(mcp, log_headers: bool = False) -> None:
     """Register OAuth discovery and proxy routes for auth debugging."""
     auth_metadata = build_authorization_server_metadata()
     if auth_metadata is None:
@@ -230,19 +246,20 @@ def register_auth_debug_routes(mcp) -> None:
         upstream_authorize_url=upstream_authorize_url,
         upstream_token_url=upstream_token_url,
         upstream_register_url=upstream_register_url,
+        log_headers=log_headers,
     )
 
     @mcp.custom_route("/oauth/register", methods=["POST"])
     async def _register(request: Request) -> Response:
-        return await _proxy_request(request, upstream_register_url)
+        return await _proxy_request(request, upstream_register_url, log_headers)
 
     @mcp.custom_route("/oauth/authorize", methods=["GET"])
     async def _authorize(request: Request) -> Response:
-        return await _proxy_request(request, upstream_authorize_url)
+        return await _proxy_request(request, upstream_authorize_url, log_headers)
 
     @mcp.custom_route("/oauth/token", methods=["POST"])
     async def _token(request: Request) -> Response:
-        return await _proxy_request(request, upstream_token_url)
+        return await _proxy_request(request, upstream_token_url, log_headers)
 
     @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
     @mcp.custom_route(

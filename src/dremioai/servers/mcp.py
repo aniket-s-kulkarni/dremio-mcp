@@ -652,13 +652,15 @@ def init(
     support_project_id_endpoints: bool = False,
     mock: bool = False,
     auth_debug: bool = False,
+    auth_debug_log_headers: bool = False,
     mock_token_expiry: int = 3600,
     mock_refresh_token_expiry: int = 86400,
     disable_dns_rebinding_protection: bool = False,
 ) -> FastMCP:
     mcp_cls = FastMCP if transport == Transports.stdio else FastMCPServerWithAuthToken
     log.logger("init").info(
-        f"Initializing MCP server with mode={mode}, mock={mock}, auth_debug={auth_debug}, class={mcp_cls.__name__}"
+        f"Initializing MCP server with mode={mode}, mock={mock}, auth_debug={auth_debug}, "
+        f"auth_debug_log_headers={auth_debug_log_headers}, class={mcp_cls.__name__}"
     )
     opts = {"log_level": "DEBUG", "debug": True, "lifespan": _server_lifespan}
     if transport == Transports.streamable_http:
@@ -757,7 +759,7 @@ def init(
     if auth_debug:
         from dremioai.servers.auth_debug import register_auth_debug_routes
 
-        register_auth_debug_routes(mcp)
+        register_auth_debug_routes(mcp, log_headers=auth_debug_log_headers)
     elif not mock:
 
         # FastMCP can expose RFC 9728 metadata from `settings.auth.resource_server_url`,
@@ -950,6 +952,15 @@ def main(
             )
         ),
     ] = False,
+    auth_debug_log_headers: Annotated[
+        Optional[bool],
+        Option(
+            help=(
+                "With --auth-debug, include request/response headers in auth debug "
+                "proxy logs"
+            )
+        ),
+    ] = False,
     mock_token_expiry: Annotated[
         Optional[int],
         Option(help="Mock mode: access token expiry in seconds"),
@@ -1019,6 +1030,7 @@ def main(
         support_project_id_endpoints=True,
         mock=mock,
         auth_debug=auth_debug,
+        auth_debug_log_headers=auth_debug_log_headers,
         mock_token_expiry=mock_token_expiry,
         mock_refresh_token_expiry=mock_refresh_token_expiry,
         disable_dns_rebinding_protection=disable_dns_rebinding_protection,
